@@ -2,26 +2,129 @@
 
 =head1 NAME
 
-Danga::Socket - Event-driven async IO class
+Danga::Socket - Event loop and event-driven async socket base class
 
 =head1 SYNOPSIS
 
+  package My::Socket
+  use Danga::Socket;
   use base ('Danga::Socket');
+  use fields ('my_attribute');
+
+  sub new {
+     my My::Socket $self = shift;
+     $self = fields::new($self) unless ref $self;
+     $self->SUPER::new( @_ );
+
+     $self->{my_attribute} = 1234;
+     return $self;
+  }
+
+  sub event_err { ... }
+  sub event_hup { ... }
+  sub event_write { ... }
+  sub event_read { ... }
+  sub close { ... }
+
+  $my_sock->tcp_cork($bool);
+
+  # write returns 1 if all writes have gone through, or 0 if there
+  # are writes in queue
+  $my_sock->write($scalar);
+  $my_sock->write($scalarref);
+  $my_sock->write(sub { ... });  # run when previous data written
+  $my_sock->write(undef);        # kick-starts
+
+  # read max $bytecount bytes, or undef on connection closed
+  $scalar_ref = $my_sock->read($bytecount);
+
+  # watch for writability.  not needed with ->write().  write()
+  # will automatically turn on watch_write when you wrote too much
+  # and turn it off when done
+  $my_sock->watch_write($bool);
+
+  # watch for readability
+  $my_sock->watch_read($bool);
+
+  # if you read too much and want to push some back on
+  # readable queue.  (not incredibly well-tested)
+  $my_sock->push_back_read($buf); # scalar or scalar ref
+
+  Danga::Socket->AddOtherFds(..);
+  Danga::Socket->SetLoopTimeout(..);
+  Danga::Socket->DescriptorMap();
+  Danga::Socket->WatchedSockets();  # count of DescriptorMap keys
+  Danga::Socket->SetPostLoopCallback($code);
+  Danga::Socket->EventLoop();
 
 =head1 DESCRIPTION
 
 This is an abstract base class which provides the basic framework for
-event-driven asynchronous IO.
+event-driven asynchronous IO, designed to be fast.
+
+Callers subclass Danga::Socket.  Danga::Socket's constructor registers
+itself with the Danga::Socket event loop (which uses the efficient
+epoll on Linux 2.6) and invokes callbacks on the object for readability,
+writability, errors, and other conditions.
+
+=head1 MORE INFO
+
+For now, see servers using Danga::Socket for guidance.  For example:
+perlbal, mogilefsd, or ddlockd.
+
+=head1 AUTHORS
+
+Brad Fitzpatrick <brad@danga.com>, Michael Granger <ged@danga.com>,
+Mark Smith <marksmith@danga.com>
+
+=head1 BUGS
+
+Not documented.
+
+Doesn't use kqueue on FreeBSD because it looks hard to do without XS
+which this code happily avoids.  (epoll is implemented with only
+Perl's 'syscall')
+
+Syscall numbers 254, 255, and 256 are used when SYS_epoll_* constants
+aren't available, but those numbers are hard-coded values from the i386
+Linux architecture.
+
+The packed data used with the epoll syscalls is likely only to work on
+32-bit Linux x86.  None of this code has been tested much on other
+platforms or architectures.
+
+=head1 LICENSE
+
+License is granted to use and distribute this module under the same
+terms as Perl itself.
 
 =cut
 
 ###########################################################################
 
+# we load syscall numbers into main to avoid stealing them from any other
+# potential users.  this is not ideal, but the best we can think of for now.
+# in particular, a later module doing:
+#
+#     package Bar;
+#     require 'syscall.ph';
+#     my $foo = &SYS_open;
+#
+# will fail because syscall.ph has already been loaded into main::.
+# Perhaps all modules that use syscall.ph should agree to load that into main::.
+#
+
+package main;
+eval { require 'syscall.ph'; 1 } || eval { require 'sys/syscall.ph'; 1 };
+
+# and here begins the actual module, which refers to the above-loaded
+# definitions as &::SYS_*
+
 package Danga::Socket;
 use strict;
 
 use vars qw{$VERSION};
-$VERSION = do { my @r = (q$Revision: 1.20 $ =~ /\d+/g); sprintf "%d."."%02d" x $#r, @r };
+$VERSION = do { my @r = (q$Revision: 1.25 $ =~ /\d+/g); sprintf "%d."."%02d" x $#r, @r };
 
 use fields qw(sock fd write_buf write_buf_offset write_buf_size
               read_push_back
@@ -36,9 +139,6 @@ use Carp qw{croak confess};
 use constant TCP_CORK => 3; # FIXME: not hard-coded (Linux-specific too)
 
 use constant DebugLevel => 0;
-
-# for epoll definitions:
-our $HAVE_SYSCALL_PH = eval { require 'syscall.ph'; 1 } || eval { require 'sys/syscall.ph'; 1 };
 
 # Explicitly define the poll constants, as either one set or the other won't be
 # loaded. They're also badly implemented in IO::Epoll:
@@ -69,9 +169,11 @@ our (
      %OtherFds,                  # A hash of "other" (non-Danga::Socket) file
                                  # descriptors for the event loop to track.
      $PostLoopCallback,          # subref to call at the end of each loop, if defined
+     $LoopTimeout,               # timeout of event loop in milliseconds
      );
 
 %OtherFds = ();
+$LoopTimeout = -1; # no timeout by default
 
 #####################################################################
 ### C L A S S   M E T H O D S
@@ -105,6 +207,19 @@ sub OtherFds {
     return wantarray ? %OtherFds : \%OtherFds;
 }
 
+### (CLASS) METHOD: AddOtherFds( [%fdmap] )
+### Add fds to the OtherFds hash for processing.
+sub AddOtherFds {
+    my $class = shift;
+    %OtherFds = ( %OtherFds, @_ ); # FIXME investigate what happens on dupe fds
+    return wantarray ? %OtherFds : \%OtherFds;
+}
+
+### (CLASS) METHOD: SetLoopTimeout( $timeout )
+### Set the loop timeout for the event loop to some value in milliseconds.
+sub SetLoopTimeout {
+    return $LoopTimeout = $_[1] + 0;
+}
 
 ### (CLASS) METHOD: DescriptorMap()
 ### Get the hash of Danga::Socket objects keyed by the file descriptor they are
@@ -157,8 +272,8 @@ sub EpollEventLoop {
         my @events;
         my $i;
         my $evcount;
-        # get up to 1000 events, no timeout (-1)
-        while ($evcount = epoll_wait($Epoll, 1000, -1, \@events)) {
+        # get up to 1000 events, class default timeout value
+        while (($evcount = epoll_wait($Epoll, 1000, $LoopTimeout, \@events)) >= 0) {
           EVENT:
             for ($i=0; $i<$evcount; $i++) {
                 my $ev = $events[$i];
@@ -333,19 +448,39 @@ sub tcp_cork {
 
     # if we failed, close (if we're not already) and warn about the error
     unless ($rv) {
-        if ($rv == EBADF || $rv == ENOTSOCK) {
+        if ($! == EBADF || $! == ENOTSOCK) {
             # internal state is probably corrupted; warn and then close if
             # we're not closed already
             warn "setsockopt: $!";
             $self->close('tcp_cork_failed')
                 unless $self->{closed};
-        } elsif ($rv == ENOPROTOOPT) {
+        } elsif ($! == ENOPROTOOPT) {
             # TCP implementation doesn't support corking, so just ignore it
         } else {
             # some other error; we should never hit here, but if we do, die
             die "setsockopt: $!";
         }
     }
+}
+
+### METHOD: steal_socket
+### Basically returns our socket and makes it so that we don't try to close it,
+### but we do remove it from epoll handlers.
+sub steal_socket {
+    my Danga::Socket $self = shift;
+
+    # make sure we have a socket
+    my $sock = $self->{sock};
+    return unless $sock;
+
+    # now remove this socket from our epoll handler (otherwise we get confused)
+    $self->tcp_cork(0);
+    epoll_ctl($Epoll, EPOLL_CTL_DEL, $self->{fd}, $self->{event_watch})
+        if $HaveEpoll;
+
+    # now return the socket
+    $self->{sock} = undef;
+    return $sock;
 }
 
 ### METHOD: close( [$reason] )
@@ -368,7 +503,7 @@ sub close {
         print STDERR "Closing \#$fd due to $pkg/$filename/$line ($reason)\n";
     }
 
-    if ($HaveEpoll) {
+    if ($HaveEpoll && $sock) {
         if (epoll_ctl($Epoll, EPOLL_CTL_DEL, $fd, $self->{event_watch}) == 0) {
             DebugLevel >= 1 && $self->debugmsg("Client %d disconnected.\n", $fd);
         } else {
@@ -381,7 +516,7 @@ sub close {
 
     # defer closing the actual socket until the event loop is done
     # processing this round of events.  (otherwise we might reuse fds)
-    push @ToClose, $sock;
+    push @ToClose, $sock if $sock;
 
     return 0;
 }
@@ -611,7 +746,7 @@ sub watch_read {
 }
 
 
-### METHOD: watch_read( $boolean )
+### METHOD: watch_write( $boolean )
 ### Turn 'writable' event notification on or off.
 sub watch_write {
     my Danga::Socket $self = shift;
@@ -692,7 +827,7 @@ sub SetPostLoopCallback {
 ### U T I L I T Y   F U N C T I O N S
 #####################################################################
 
-our $SYS_epoll_create = eval { &SYS_epoll_create } || 254; # linux-ix86 default
+our $SYS_epoll_create = eval { &::SYS_epoll_create } || 254; # linux-ix86 default
 
 # epoll_create wrapper
 # ARGS: (size)
@@ -704,17 +839,17 @@ sub epoll_create {
 
 # epoll_ctl wrapper
 # ARGS: (epfd, op, fd, events)
-our $SYS_epoll_ctl = eval { &SYS_epoll_ctl } || 255; # linux-ix86 default
+our $SYS_epoll_ctl = eval { &::SYS_epoll_ctl } || 255; # linux-ix86 default
 sub epoll_ctl {
     syscall($SYS_epoll_ctl, $_[0]+0, $_[1]+0, $_[2]+0, pack("LLL", $_[3], $_[2]));
 }
 
 # epoll_wait wrapper
-# ARGS: (epfd, maxevents, timeout, arrayref)
+# ARGS: (epfd, maxevents, timeout (milliseconds), arrayref)
 #  arrayref: values modified to be [$fd, $event]
 our $epoll_wait_events;
 our $epoll_wait_size = 0;
-our $SYS_epoll_wait = eval { &SYS_epoll_wait } || 256; # linux-ix86 default
+our $SYS_epoll_wait = eval { &::SYS_epoll_wait } || 256; # linux-ix86 default
 sub epoll_wait {
     # resize our static buffer if requested size is bigger than we've ever done
     if ($_[1] > $epoll_wait_size) {
