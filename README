@@ -1,0 +1,4 @@
+This is Brad Fitzpatrick's asynchronous socket I/O abstraction
+layer, submitted to CPAN by David Weekly <david@weekly.org> as
+taken on September 24, 2004 from Danga CVS at:
+http://cvs.danga.com/browse.cgi/wcmtools/lib/Danga-Socket/
