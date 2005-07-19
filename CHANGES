@@ -1,3 +1,36 @@
+1.42:
+   -- use the right epoll system call numbers on non-x86
+      machines
+   -- start of a good test suite
+   -- 64-bit struct support (test suite passes on ia64, ppc)
+      (and presumably ppc64, but yet untested)
+
+
+1.41:
+   -- make the Poll mode behave like Epoll/Kqueue in that
+      fds returned w/ no corresponding Danga::Socket object
+      or OtherFds coderef just get ignored.  make it robust
+      against apps with races, perhaps?  patch from Justin Azoff
+      <JAzoff@uamail.albany.edu>
+
+1.40:
+
+   -- Kqueue support from Matt Sergeant
+
+1.39:
+
+   -- make BSD::Resource optional
+
+1.38:
+
+   -- added support for profiling (epoll only at the moment while this
+      feature is further fleshed out); user application is required to
+      enable profiling and actually process the resultant data
+
+   -- if epoll_wait returns an event we can't handle, delete it.
+      this means the application fucked up and lost its state somehow.
+      or maybe Danga::Socket did?  still debugging this in Perlbal.
+
 1.25: (2004-10-22)
 
    -- move the syscall.ph require into "package main" rather than stealing

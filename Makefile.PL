@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 #
 #   Perl Makefile for Danga-Socket
-#   $Id: Makefile.PL,v 1.2 2004/10/18 17:55:33 bradfitz Exp $
+#   $Id: Makefile.PL,v 1.6 2005/03/08 01:02:35 bradfitz Exp $
 #
 #   Invoke with 'perl Makefile.PL'
 #
@@ -20,6 +20,8 @@ WriteMakefile(
         'Socket'        => 0,
         'IO::Poll'      => 0,
         fields          => 0,
+        'POSIX'         => 0,
+        'Test::More'    => 0,
     },
     dist                    => {
         CI                      => "cvs commit",

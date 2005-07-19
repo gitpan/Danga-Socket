@@ -51,7 +51,7 @@ Danga::Socket - Event loop and event-driven async socket base class
   $my_sock->push_back_read($buf); # scalar or scalar ref
 
   Danga::Socket->AddOtherFds(..);
-  Danga::Socket->SetLoopTimeout(..);
+  Danga::Socket->SetLoopTimeout($millisecs);
   Danga::Socket->DescriptorMap();
   Danga::Socket->WatchedSockets();  # count of DescriptorMap keys
   Danga::Socket->SetPostLoopCallback($code);
@@ -74,8 +74,13 @@ perlbal, mogilefsd, or ddlockd.
 
 =head1 AUTHORS
 
-Brad Fitzpatrick <brad@danga.com>, Michael Granger <ged@danga.com>,
-Mark Smith <marksmith@danga.com>
+Brad Fitzpatrick <brad@danga.com> - author
+
+Michael Granger <ged@danga.com> - docs, testing
+
+Mark Smith <junior@danga.com> - contributor, heavy user, testing
+
+Matt Sergeant <matt@sergeant.org> - kqueue support
 
 =head1 BUGS
 
@@ -122,13 +127,23 @@ eval { require 'syscall.ph'; 1 } || eval { require 'sys/syscall.ph'; 1 };
 
 package Danga::Socket;
 use strict;
+use POSIX ();
+
+my $opt_bsd_resource = eval "use BSD::Resource; 1;";
 
 use vars qw{$VERSION};
-$VERSION = do { my @r = (q$Revision: 1.25 $ =~ /\d+/g); sprintf "%d."."%02d" x $#r, @r };
+$VERSION = "1.42";
 
-use fields qw(sock fd write_buf write_buf_offset write_buf_size
-              read_push_back
-              closed event_watch debug_level);
+use fields ('sock',              # underlying socket
+            'fd',                # numeric file descriptor
+            'write_buf',         # arrayref of scalars, scalarrefs, or coderefs to write
+            'write_buf_offset',  # offset into first array of write_buf to start writing at
+            'write_buf_size',    # total length of data in all write_buf items
+            'read_push_back',    # arrayref of "pushed-back" read data the application didn't want
+            'closed',            # bool: socket is closed
+            'corked',            # bool: socket is corked
+            'event_watch',       # bitmask of events the client is interested in (POLLIN,OUT,etc.)
+            );
 
 use Errno qw(EINPROGRESS EWOULDBLOCK EISCONN ENOTSOCK
              EPIPE EAGAIN EBADF ECONNRESET ENOPROTOOPT);
@@ -159,25 +174,42 @@ use constant POLLERR       => 8;
 use constant POLLHUP       => 16;
 use constant POLLNVAL      => 32;
 
+our $HAVE_KQUEUE = eval { require IO::KQueue; 1 };
+
 # keep track of active clients
 our (
      $HaveEpoll,                 # Flag -- is epoll available?  initially undefined.
+     $HaveKQueue,
      %DescriptorMap,             # fd (num) -> Danga::Socket object
      %PushBackSet,               # fd (num) -> Danga::Socket (fds with pushed back read data)
      $Epoll,                     # Global epoll fd (for epoll mode only)
+     $KQueue,                    # Global kqueue fd (for kqueue mode only)
      @ToClose,                   # sockets to close when event loop is done
      %OtherFds,                  # A hash of "other" (non-Danga::Socket) file
                                  # descriptors for the event loop to track.
      $PostLoopCallback,          # subref to call at the end of each loop, if defined
      $LoopTimeout,               # timeout of event loop in milliseconds
+     $DoProfile,                 # if on, enable profiling
+     %Profiling,                 # what => [ utime, stime, calls ]
      );
 
-%OtherFds = ();
-$LoopTimeout = -1; # no timeout by default
+Reset();
 
 #####################################################################
 ### C L A S S   M E T H O D S
 #####################################################################
+
+# (CLASS) method: reset all state
+sub Reset {
+    %DescriptorMap = ();
+    %PushBackSet = ();
+    @ToClose = ();
+    %OtherFds = ();
+    $PostLoopCallback = undef;
+    $LoopTimeout = -1;  # no timeout by default
+    $DoProfile = 0;
+    %Profiling = ();
+}
 
 ### (CLASS) METHOD: HaveEpoll()
 ### Returns a true value if this class will use IO::Epoll for async IO.
@@ -191,12 +223,33 @@ sub WatchedSockets {
 }
 *watched_sockets = *WatchedSockets;
 
+### (CLASS) METHOD: EnableProfiling()
+### Turns profiling on, clearing current profiling data.
+sub EnableProfiling {
+    if ($opt_bsd_resource) {
+        %Profiling = ();
+        $DoProfile = 1;
+        return 1;
+    }
+    return 0;
+}
+
+### (CLASS) METHOD: DisableProfiling()
+### Turns off profiling, but retains data up to this point
+sub DisableProfiling {
+    $DoProfile = 0;
+}
+
+### (CLASS) METHOD: ProfilingData()
+### Returns reference to a hash of data in format above (see %Profiling)
+sub ProfilingData {
+    return \%Profiling;
+}
 
 ### (CLASS) METHOD: ToClose()
 ### Return the list of sockets that are awaiting close() at the end of the
 ### current event loop.
 sub ToClose { return @ToClose; }
-
 
 ### (CLASS) METHOD: OtherFds( [%fdmap] )
 ### Get/set the hash of file descriptors that need processing in parallel with
@@ -230,15 +283,28 @@ sub DescriptorMap {
 *descriptor_map = *DescriptorMap;
 *get_sock_ref = *DescriptorMap;
 
+our $DoneInit = 0;
 sub init_poller
 {
-    return if defined $HaveEpoll;
+    return if $DoneInit;
+    $DoneInit = 1;
 
-    $Epoll = eval { epoll_create(1024); };
-    $HaveEpoll = $Epoll >= 0;
-    if ($HaveEpoll) {
-        *EventLoop = *EpollEventLoop;
-    } else {
+    if ($HAVE_KQUEUE) {
+        $KQueue = IO::KQueue->new();
+        $HaveKQueue = $KQueue >= 0;
+        if ($HaveKQueue) {
+            *EventLoop = *KQueueEventLoop;
+        }
+    }
+    elsif ($^O eq "linux") {
+        $Epoll = eval { epoll_create(1024); };
+        $HaveEpoll = defined $Epoll && $Epoll >= 0;
+        if ($HaveEpoll) {
+            *EventLoop = *EpollEventLoop;
+        }
+    }
+
+    if (!$HaveEpoll && !$HaveKQueue) {
         require IO::Poll;
         *EventLoop = *PollEventLoop;
     }
@@ -253,11 +319,34 @@ sub EventLoop {
 
     if ($HaveEpoll) {
         EpollEventLoop($class);
+    } elsif ($HaveKQueue) {
+        KQueueEventLoop($class);
     } else {
         PollEventLoop($class);
     }
 }
 
+## profiling-related data/functions
+our ($Prof_utime0, $Prof_stime0);
+sub _pre_profile {
+    ($Prof_utime0, $Prof_stime0) = getrusage();
+}
+
+sub _post_profile {
+    # get post information
+    my ($autime, $astime) = getrusage();
+
+    # calculate differences
+    my $utime = $autime - $Prof_utime0;
+    my $stime = $astime - $Prof_stime0;
+
+    foreach my $k (@_) {
+        $Profiling{$k} ||= [ 0.0, 0.0, 0 ];
+        $Profiling{$k}->[0] += $utime;
+        $Profiling{$k}->[1] += $stime;
+        $Profiling{$k}->[2]++;
+    }
+}
 
 ### The epoll-based event loop. Gets installed as EventLoop if IO::Epoll loads
 ### okay.
@@ -265,7 +354,9 @@ sub EpollEventLoop {
     my $class = shift;
 
     foreach my $fd ( keys %OtherFds ) {
-        epoll_ctl($Epoll, EPOLL_CTL_ADD, $fd, EPOLLIN);
+        if (epoll_ctl($Epoll, EPOLL_CTL_ADD, $fd, EPOLLIN) == -1) {
+            print STDERR "epoll_ctl(): failure adding fd=$fd; $! (", $!+0, ")\n";
+        }
     }
 
     while (1) {
@@ -291,6 +382,11 @@ sub EpollEventLoop {
                 if (! $pob) {
                     if (my $code = $OtherFds{$ev->[0]}) {
                         $code->($state);
+                    } else {
+                        my $fd = $ev->[0];
+                        print STDERR "epoll() returned fd $fd w/ state $state for which we have no mapping.  removing.\n";
+                        POSIX::close($fd);
+                        epoll_ctl($Epoll, EPOLL_CTL_DEL, $fd, 0);
                     }
                     next;
                 }
@@ -298,6 +394,39 @@ sub EpollEventLoop {
                 DebugLevel >= 1 && $class->DebugMsg("Event: fd=%d (%s), state=%d \@ %s\n",
                                                     $ev->[0], ref($pob), $ev->[1], time);
 
+                if ($DoProfile) {
+                    my $class = ref $pob;
+
+                    # call profiling action on things that need to be done
+                    if ($state & EPOLLIN && ! $pob->{closed}) {
+                        _pre_profile();
+                        $pob->event_read;
+                        _post_profile("$class-read");
+                    }
+
+                    if ($state & EPOLLOUT && ! $pob->{closed}) {
+                        _pre_profile();
+                        $pob->event_write;
+                        _post_profile("$class-write");
+                    }
+
+                    if ($state & (EPOLLERR|EPOLLHUP)) {
+                        if ($state & EPOLLERR && ! $pob->{closed}) {
+                            _pre_profile();
+                            $pob->event_err;
+                            _post_profile("$class-err");
+                        }
+                        if ($state & EPOLLHUP && ! $pob->{closed}) {
+                            _pre_profile();
+                            $pob->event_hup;
+                            _post_profile("$class-hup");
+                        }
+                    }
+
+                    next;
+                }
+
+                # standard non-profiling codepat
                 $pob->event_read   if $state & EPOLLIN && ! $pob->{closed};
                 $pob->event_write  if $state & EPOLLOUT && ! $pob->{closed};
                 if ($state & (EPOLLERR|EPOLLHUP)) {
@@ -358,10 +487,21 @@ sub PollEventLoop {
         while ( my ($fd, $sock) = each %DescriptorMap ) {
             push @poll, $fd, $sock->{event_watch};
         }
-        return 0 unless @poll;
 
-        my $count = IO::Poll::_poll(-1, @poll);
-        next unless $count;
+        # if nothing to poll, either end immediately (if no timeout)
+        # or just keep calling the callback
+        unless (@poll) {
+            my $timeout = $LoopTimeout > 0 ? $LoopTimeout : 1000;
+            select undef, undef, undef, ($timeout / 1000);
+            return unless PostEventLoop();
+            next;
+        }
+
+        my $count = IO::Poll::_poll($LoopTimeout, @poll);
+        unless ($count) {
+            return unless PostEventLoop();
+            next;
+        }
 
         # Fetch handles with read events
         while (@poll) {
@@ -370,8 +510,10 @@ sub PollEventLoop {
 
             $pob = $DescriptorMap{$fd};
 
-            if ( !$pob && (my $code = $OtherFds{$fd}) ) {
-                $code->($state);
+            if (!$pob) {
+                if (my $code = $OtherFds{$fd}) {
+                    $code->($state);
+                }
                 next;
             }
 
@@ -387,6 +529,54 @@ sub PollEventLoop {
     exit 0;
 }
 
+### The kqueue-based event loop. Gets installed as EventLoop if IO::KQueue works
+### okay.
+sub KQueueEventLoop {
+    my $class = shift;
+
+    foreach my $fd (keys %OtherFds) {
+        $KQueue->EV_SET($fd, IO::KQueue::EVFILT_READ(), IO::KQueue::EV_ADD());
+    }
+
+    while (1) {
+        my @ret = $KQueue->kevent($LoopTimeout);
+        if (!@ret) {
+            foreach my $fd ( keys %DescriptorMap ) {
+                my Danga::Socket $sock = $DescriptorMap{$fd};
+                if ($sock->can('ticker')) {
+                    $sock->ticker;
+                }
+            }
+        }
+
+        foreach my $kev (@ret) {
+            my ($fd, $filter, $flags, $fflags) = @$kev;
+            my Danga::Socket $pob = $DescriptorMap{$fd};
+            if (!$pob) {
+                if (my $code = $OtherFds{$fd}) {
+                    $code->($filter);
+                }
+                next;
+            }
+
+            DebugLevel >= 1 && $class->DebugMsg("Event: fd=%d (%s), flags=%d \@ %s\n",
+                                                        $fd, ref($pob), $flags, time);
+
+            $pob->event_read  if $filter == IO::KQueue::EVFILT_READ()  && !$pob->{closed};
+            $pob->event_write if $filter == IO::KQueue::EVFILT_WRITE() && !$pob->{closed};
+            if ($flags ==  IO::KQueue::EV_EOF() && !$pob->{closed}) {
+                if ($fflags) {
+                    $pob->event_err;
+                } else {
+                    $pob->event_hup;
+                }
+            }
+        }
+        return unless PostEventLoop();
+    }
+
+    exit(0);
+}
 
 ### (CLASS) METHOD: DebugMsg( $format, @args )
 ### Print the debugging message specified by the C<sprintf>-style I<format> and
@@ -414,6 +604,7 @@ sub new {
     $self->{write_buf_offset} = 0;
     $self->{write_buf_size} = 0;
     $self->{closed} = 0;
+    $self->{corked} = 0;
     $self->{read_push_back} = [];
 
     $self->{event_watch} = POLLERR|POLLHUP|POLLNVAL;
@@ -423,7 +614,13 @@ sub new {
     if ($HaveEpoll) {
         epoll_ctl($Epoll, EPOLL_CTL_ADD, $fd, $self->{event_watch})
             and die "couldn't add epoll watch for $fd\n";
-
+    }
+    elsif ($HaveKQueue) {
+        # Add them to the queue but disabled for now
+        $KQueue->EV_SET($fd, IO::KQueue::EVFILT_READ(),
+                        IO::KQueue::EV_ADD() | IO::KQueue::EV_DISABLE());
+        $KQueue->EV_SET($fd, IO::KQueue::EVFILT_WRITE(),
+                        IO::KQueue::EV_ADD() | IO::KQueue::EV_DISABLE());
     }
 
     $DescriptorMap{$fd} = $self;
@@ -439,21 +636,26 @@ sub new {
 ### METHOD: tcp_cork( $boolean )
 ### Turn TCP_CORK on or off depending on the value of I<boolean>.
 sub tcp_cork {
-    my Danga::Socket $self = shift;
-    my $val = shift;
+    my Danga::Socket $self = $_[0];
+    my $val = $_[1];
+
+    # make sure we have a socket
+    return unless $self->{sock};
+    return if $val == $self->{corked};
 
     # FIXME: Linux-specific.
     my $rv = setsockopt($self->{sock}, IPPROTO_TCP, TCP_CORK,
            pack("l", $val ? 1 : 0));
 
     # if we failed, close (if we're not already) and warn about the error
-    unless ($rv) {
+    if ($rv) {
+        $self->{corked} = $val;
+    } else {
         if ($! == EBADF || $! == ENOTSOCK) {
             # internal state is probably corrupted; warn and then close if
             # we're not closed already
             warn "setsockopt: $!";
-            $self->close('tcp_cork_failed')
-                unless $self->{closed};
+            $self->close('tcp_cork_failed');
         } elsif ($! == ENOPROTOOPT) {
             # TCP implementation doesn't support corking, so just ignore it
         } else {
@@ -465,20 +667,17 @@ sub tcp_cork {
 
 ### METHOD: steal_socket
 ### Basically returns our socket and makes it so that we don't try to close it,
-### but we do remove it from epoll handlers.
+### but we do remove it from epoll handlers.  THIS CLOSES $self.  It is the same
+### thing as calling close, except it gives you the socket to use.
 sub steal_socket {
-    my Danga::Socket $self = shift;
+    my Danga::Socket $self = $_[0];
+    return if $self->{closed};
 
-    # make sure we have a socket
+    # cleanup does most of the work of closing this socket
+    $self->_cleanup();
+
+    # now undef our internal sock and fd structures so we don't use them
     my $sock = $self->{sock};
-    return unless $sock;
-
-    # now remove this socket from our epoll handler (otherwise we get confused)
-    $self->tcp_cork(0);
-    epoll_ctl($Epoll, EPOLL_CTL_DEL, $self->{fd}, $self->{event_watch})
-        if $HaveEpoll;
-
-    # now return the socket
     $self->{sock} = undef;
     return $sock;
 }
@@ -486,11 +685,35 @@ sub steal_socket {
 ### METHOD: close( [$reason] )
 ### Close the socket. The I<reason> argument will be used in debugging messages.
 sub close {
-    my Danga::Socket $self = shift;
-    my $reason = shift || "";
+    my Danga::Socket $self = $_[0];
+    return if $self->{closed};
 
-    my $fd = $self->{fd};
-    my $sock = $self->{sock};
+    # print out debugging info for this close
+    if (DebugLevel) {
+        my ($pkg, $filename, $line) = caller;
+        my $reason = $_[1] || "";
+        print STDERR "Closing \#$self->{fd} due to $pkg/$filename/$line ($reason)\n";
+    }
+
+    # this does most of the work of closing us
+    $self->_cleanup();
+
+    # defer closing the actual socket until the event loop is done
+    # processing this round of events.  (otherwise we might reuse fds)
+    if ($self->{sock}) {
+        push @ToClose, $self->{sock};
+        $self->{sock} = undef;
+    }
+
+    return 0;
+}
+
+### METHOD: _cleanup()
+### Called by our closers so we can clean internal data structures.
+sub _cleanup {
+    my Danga::Socket $self = $_[0];
+
+    # we're effectively closed; we have no fd and sock when we leave here
     $self->{closed} = 1;
 
     # we need to flush our write buffer, as there may
@@ -498,30 +721,27 @@ sub close {
     # preventing the object from being destroyed
     $self->{write_buf} = [];
 
-    if (DebugLevel) {
-        my ($pkg, $filename, $line) = caller;
-        print STDERR "Closing \#$fd due to $pkg/$filename/$line ($reason)\n";
-    }
+    # uncork so any final data gets sent.  only matters if the person closing
+    # us forgot to do it, but we do it to be safe.
+    $self->tcp_cork(0);
 
-    if ($HaveEpoll && $sock) {
-        if (epoll_ctl($Epoll, EPOLL_CTL_DEL, $fd, $self->{event_watch}) == 0) {
-            DebugLevel >= 1 && $self->debugmsg("Client %d disconnected.\n", $fd);
-        } else {
-            DebugLevel >= 1 && $self->debugmsg("poll->remove failed on fd %d\n", $fd);
+    # if we're using epoll, we have to remove this from our epoll fd so we stop getting
+    # notifications about it
+    if ($HaveEpoll && $self->{fd}) {
+        if (epoll_ctl($Epoll, EPOLL_CTL_DEL, $self->{fd}, $self->{event_watch}) != 0) {
+            # dump_error prints a backtrace so we can try to figure out why this happened
+            $self->dump_error("epoll_ctl(): failure deleting fd=$self->{fd} during _cleanup(); $! (" . ($!+0) . ")");
         }
     }
 
-    delete $DescriptorMap{$fd};
-    delete $PushBackSet{$fd};
+    # now delete from mappings.  this fd no longer belongs to us, so we don't want
+    # to get alerts for it if it becomes writable/readable/etc.
+    delete $DescriptorMap{$self->{fd}};
+    delete $PushBackSet{$self->{fd}};
 
-    # defer closing the actual socket until the event loop is done
-    # processing this round of events.  (otherwise we might reuse fds)
-    push @ToClose, $sock if $sock;
-
-    return 0;
+    # and finally get rid of our fd so we can't use it anywhere else
+    $self->{fd} = undef;
 }
-
-
 
 ### METHOD: sock()
 ### Returns the underlying IO::Handle for the object.
@@ -584,10 +804,16 @@ sub write {
                     shift @{$self->{write_buf}};
                 }
                 $bref->();
+
+                # code refs are just run and never get reenqueued
+                # (they're one-shot), so turn off the flag indicating the
+                # outstanding data needs queueing.
+                $need_queue = 0;
+
                 undef $bref;
                 next WRITE;
             }
-            die "Write error: $@";
+            die "Write error: $@ <$bref>";
         }
 
         my $to_write = $len - $self->{write_buf_offset};
@@ -727,45 +953,69 @@ sub event_write {
 ### Turn 'readable' event notification on or off.
 sub watch_read {
     my Danga::Socket $self = shift;
-    return if $self->{closed};
+    return if $self->{closed} || !$self->{sock};
 
     my $val = shift;
     my $event = $self->{event_watch};
+    
     $event &= ~POLLIN if ! $val;
     $event |=  POLLIN if   $val;
-
+    
     # If it changed, set it
     if ($event != $self->{event_watch}) {
-        if ($HaveEpoll) {
+        if ($HaveKQueue) {
+            $KQueue->EV_SET($self->{fd}, IO::KQueue::EVFILT_READ(),
+                            $val ? IO::KQueue::EV_ENABLE() : IO::KQueue::EV_DISABLE());
+        }
+        elsif ($HaveEpoll) {
             epoll_ctl($Epoll, EPOLL_CTL_MOD, $self->{fd}, $event)
-                and print STDERR "couldn't modify epoll settings for $self->{fd} " .
-                "($self) from $self->{event_watch} -> $event\n";
+                and $self->dump_error("couldn't modify epoll settings for $self->{fd} " .
+                                      "from $self->{event_watch} -> $event: $! (" . ($!+0) . ")");
         }
         $self->{event_watch} = $event;
     }
 }
 
-
 ### METHOD: watch_write( $boolean )
 ### Turn 'writable' event notification on or off.
 sub watch_write {
     my Danga::Socket $self = shift;
-    return if $self->{closed};
+    return if $self->{closed} || !$self->{sock};
 
     my $val = shift;
     my $event = $self->{event_watch};
+    
     $event &= ~POLLOUT if ! $val;
     $event |=  POLLOUT if   $val;
 
     # If it changed, set it
     if ($event != $self->{event_watch}) {
-        if ($HaveEpoll) {
+        if ($HaveKQueue) {
+            $KQueue->EV_SET($self->{fd}, IO::KQueue::EVFILT_WRITE(),
+                            $val ? IO::KQueue::EV_ENABLE() : IO::KQueue::EV_DISABLE());
+        }
+        elsif ($HaveEpoll) {
             epoll_ctl($Epoll, EPOLL_CTL_MOD, $self->{fd}, $event)
-                and print STDERR "couldn't modify epoll settings for $self->{fd} " .
-                "($self) from $self->{event_watch} -> $event\n";
+                and $self->dump_error("couldn't modify epoll settings for $self->{fd} " .
+                                      "from $self->{event_watch} -> $event: $! (" . ($!+0) . ")");
         }
         $self->{event_watch} = $event;
     }
+}
+
+# METHOD: dump_error( $message )
+# Prints to STDERR a backtrace with information about this socket and what lead
+# up to the dump_error call.
+sub dump_error {
+    my $i = 0;
+    my @list;
+    while (my ($file, $line, $sub) = (caller($i++))[1..3]) {
+        push @list, "\t$file:$line called $sub\n";
+    }
+    
+    print STDERR "ERROR: $_[1]\n" .
+                 "\t$_[0] = " . $_[0]->as_string . "\n" .
+                 join('', @list);
 }
 
 
@@ -786,6 +1036,7 @@ sub debugmsg {
 ### Returns the string describing the peer's IP
 sub peer_ip_string {
     my Danga::Socket $self = shift;
+    return undef unless $self->{sock};
     my $pn = getpeername($self->{sock}) or return undef;
     my ($port, $iaddr) = Socket::sockaddr_in($pn);
     return Socket::inet_ntoa($iaddr);
@@ -796,6 +1047,7 @@ sub peer_ip_string {
 ### object in form "ip:port"
 sub peer_addr_string {
     my Danga::Socket $self = shift;
+    return undef unless $self->{sock};
     my $pn = getpeername($self->{sock}) or return undef;
     my ($port, $iaddr) = Socket::sockaddr_in($pn);
     return Socket::inet_ntoa($iaddr) . ":$port";
@@ -805,7 +1057,9 @@ sub peer_addr_string {
 ### Returns a string describing this socket.
 sub as_string {
     my Danga::Socket $self = shift;
-    my $ret = ref($self) . ": " . ($self->{closed} ? "closed" : "open");
+    my $rw = "(" . ($self->{event_watch} & POLLIN ? 'R' : '') .
+                   ($self->{event_watch} & POLLOUT ? 'W' : '') . ")";
+    my $ret = ref($self) . "$rw: " . ($self->{closed} ? "closed" : "open");
     my $peer = $self->peer_addr_string;
     if ($peer) {
         $ret .= " to " . $self->peer_addr_string;
@@ -827,7 +1081,45 @@ sub SetPostLoopCallback {
 ### U T I L I T Y   F U N C T I O N S
 #####################################################################
 
-our $SYS_epoll_create = eval { &::SYS_epoll_create } || 254; # linux-ix86 default
+our $SYS_epoll_create = eval { &::SYS_epoll_create } || 254; # linux-x86
+our $SYS_epoll_ctl    = eval { &::SYS_epoll_ctl }    || 255; # linux-x86
+our $SYS_epoll_wait   = eval { &::SYS_epoll_wait }   || 256; # linux-x86
+if ($^O eq "linux") {
+    my ($sysname, $nodename, $release, $version, $machine) = POSIX::uname();
+
+    # whether the machine requires 64-bit numbers to be on 8-byte
+    # boundaries.
+    my $u64_mod_8 = 0;
+
+    if ($machine eq "x86_64") {
+        $SYS_epoll_create = 213;
+        $SYS_epoll_ctl    = 233;
+        $SYS_epoll_wait   = 232;
+    } elsif ($machine eq "ppc64") {
+        $SYS_epoll_create = 236;
+        $SYS_epoll_ctl    = 237;
+        $SYS_epoll_wait   = 238;
+        $u64_mod_8        = 1;
+    } elsif ($machine eq "ppc") {
+        $SYS_epoll_create = 236;
+        $SYS_epoll_ctl    = 237;
+        $SYS_epoll_wait   = 238;
+        $u64_mod_8        = 1;
+    } elsif ($machine eq "ia64") {
+        $SYS_epoll_create = 1243;
+        $SYS_epoll_ctl    = 1244;
+        $SYS_epoll_wait   = 1245;
+        $u64_mod_8        = 1;
+    }
+
+    if ($u64_mod_8) {
+        *epoll_wait = \&epoll_wait_mod8;
+        *epoll_ctl = \&epoll_ctl_mod8;
+    } else {
+        *epoll_wait = \&epoll_wait_mod4;
+        *epoll_ctl = \&epoll_ctl_mod4;
+    }
+}
 
 # epoll_create wrapper
 # ARGS: (size)
@@ -838,10 +1130,12 @@ sub epoll_create {
 }
 
 # epoll_ctl wrapper
-# ARGS: (epfd, op, fd, events)
-our $SYS_epoll_ctl = eval { &::SYS_epoll_ctl } || 255; # linux-ix86 default
-sub epoll_ctl {
-    syscall($SYS_epoll_ctl, $_[0]+0, $_[1]+0, $_[2]+0, pack("LLL", $_[3], $_[2]));
+# ARGS: (epfd, op, fd, events_mask)
+sub epoll_ctl_mod4 {
+    syscall($SYS_epoll_ctl, $_[0]+0, $_[1]+0, $_[2]+0, pack("LLL", $_[3], $_[2], 0));
+}
+sub epoll_ctl_mod8 {
+    syscall($SYS_epoll_ctl, $_[0]+0, $_[1]+0, $_[2]+0, pack("LLLL", $_[3], 0, $_[2], 0));
 }
 
 # epoll_wait wrapper
@@ -849,12 +1143,11 @@ sub epoll_ctl {
 #  arrayref: values modified to be [$fd, $event]
 our $epoll_wait_events;
 our $epoll_wait_size = 0;
-our $SYS_epoll_wait = eval { &::SYS_epoll_wait } || 256; # linux-ix86 default
-sub epoll_wait {
+sub epoll_wait_mod4 {
     # resize our static buffer if requested size is bigger than we've ever done
     if ($_[1] > $epoll_wait_size) {
         $epoll_wait_size = $_[1];
-        $epoll_wait_events = pack("LLL") x $epoll_wait_size;
+        $epoll_wait_events = "\0" x 12 x $epoll_wait_size;
     }
     my $ct = syscall($SYS_epoll_wait, $_[0]+0, $epoll_wait_events, $_[1]+0, $_[2]+0);
     for ($_ = 0; $_ < $ct; $_++) {
@@ -863,7 +1156,22 @@ sub epoll_wait {
     return $ct;
 }
 
-
+sub epoll_wait_mod8 {
+    # resize our static buffer if requested size is bigger than we've ever done
+    if ($_[1] > $epoll_wait_size) {
+        $epoll_wait_size = $_[1];
+        $epoll_wait_events = "\0" x 16 x $epoll_wait_size;
+    }
+    my $ct = syscall($SYS_epoll_wait, $_[0]+0, $epoll_wait_events, $_[1]+0, $_[2]+0);
+    for ($_ = 0; $_ < $ct; $_++) {
+        # 16 byte epoll_event structs, with format:
+        #    4 byte mask [idx 1]
+        #    4 byte padding (we put it into idx 2, useless)
+        #    8 byte data (first 4 bytes are fd, into idx 0)
+        @{$_[3]->[$_]}[1,2,0] = unpack("LLL", substr($epoll_wait_events, 16*$_, 12));
+    }
+    return $ct;
+}
 
 1;
 
