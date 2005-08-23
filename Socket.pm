@@ -109,7 +109,7 @@ use Time::HiRes ();
 my $opt_bsd_resource = eval "use BSD::Resource; 1;";
 
 use vars qw{$VERSION};
-$VERSION = "1.44";
+$VERSION = "1.45";
 
 use warnings;
 no  warnings qw(deprecated);
@@ -378,8 +378,17 @@ sub RunTimers {
 
     return $LoopTimeout unless @Timers;
 
-    my $timeout = ($Timers[0][0] - $now) * 1000;
+    # convert time to an even number of milliseconds, adding 1
+    # extra, otherwise floating point fun can occur and we'll
+    # call RunTimers like 20-30 times, each returning a timeout
+    # of 0.0000212 seconds
+    my $timeout = int(($Timers[0][0] - $now) * 1000) + 1;
 
+    # -1 is an infinite timeout, so prefer a real timeout
+    return $timeout     if $LoopTimeout == -1;
+
+    # otherwise pick the lower of our regular timeout and time until
+    # the next timer
     return $LoopTimeout if $LoopTimeout < $timeout;
     return $timeout;
 }

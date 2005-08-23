@@ -1,3 +1,12 @@
+1.45: (2005-08-23)
+   -- don't hang forever if there is a timer but no sockets
+      and looptimeout is -1.  the problem was we always picked the
+      lesser time of LoopTimeout and NextTimerTimeout, but if LoopTimeout
+      was -1 (which means infinity), we preferred that, wrongly.
+   -- in RunTimers, calculate the milliseconds in integer, and add 1
+      to remove some floating point weirdness which caused 20-30 extra
+      loops which accomplished nothing.  see comments.
+
 1.44: (2005-08-16)
    -- fix another bug in push_back_read... ancient:  comma instead of
       semi-colon (can you tell nobody used this function before?)
