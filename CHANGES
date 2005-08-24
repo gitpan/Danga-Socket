@@ -1,3 +1,12 @@
+1.46: (2005-08-24)
+   -- warn about undef sockets in Danga::Socket's constructor, or overwriting
+      the descriptor map with a socket using the same fd as another in use.
+   -- change all print STDERR to warn (so we can trap 'em with $SIG{__WARN__})
+   -- delay the removal of fds from DescriptorMap to eliminate warnings
+      when one fds in the same epoll_wait/etc return set kills one of
+      the others which hasn't been processed yet.  new test t/12-closerace.t to
+      demonstrate the situation.
+
 1.45: (2005-08-23)
    -- don't hang forever if there is a timer but no sockets
       and looptimeout is -1.  the problem was we always picked the
