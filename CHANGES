@@ -1,10 +1,12 @@
-1.48: (2005-09-16)
-   -- allow timers to close sockets.  because RunTimers ran
-      before the event loops started, you'd close something,
-      then hang forever in epoll_wait(), and only later after
-      an event came in, then finish the close.
+1.49: (2006-03-02)
+   -- patch to allow pluggable writer functions per socket.  so you
+      can have SSL connections that do Net::SSLeay writes (or whatever)
+      instead of relying on tied handles.
 
-   -- shift_back_read from the qpsmtpd Danga::Socket tree
+1.48: (2005-10-12)
+   -- patch from Eric Lambrecht <eml@guba.com> who noticed that calling
+      sysread in Perl w/ over ~5MB could cause Perl to just die and quit.
+      so limit reads to 5MB.
 
 1.47: (2005-08-29)
    -- new $ENV{DS_DEBUG} to warn about weird conditions, which currently

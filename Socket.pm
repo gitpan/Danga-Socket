@@ -109,7 +109,7 @@ use Time::HiRes ();
 my $opt_bsd_resource = eval "use BSD::Resource; 1;";
 
 use vars qw{$VERSION};
-$VERSION = "1.48";
+$VERSION = "1.49";
 
 use warnings;
 no  warnings qw(deprecated);
@@ -127,6 +127,7 @@ use fields ('sock',              # underlying socket
             'event_watch',       # bitmask of events the client is interested in (POLLIN,OUT,etc.)
             'peer_ip',           # cached stringified IP address of $sock
             'peer_port',         # cached port number of $sock
+            'writer_func',       # subref which does writing.  must return bytes written (or undef) and set $! on errors
             );
 
 use Errno  qw(EINPROGRESS EWOULDBLOCK EISCONN ENOTSOCK
@@ -376,9 +377,6 @@ sub RunTimers {
         $to_run->[1]->($now);
     }
 
-    # close any sockets that our timers might've closed
-    CloseClosedSockets() if @ToClose;
-
     return $LoopTimeout unless @Timers;
 
     # convert time to an even number of milliseconds, adding 1
@@ -625,22 +623,6 @@ sub SetPostLoopCallback {
     }
 }
 
-sub CloseClosedSockets {
-    # now we can close sockets that wanted to close during our event processing.
-    # (we didn't want to close them during the loop, as we didn't want fd numbers
-    #  being reused and confused during the event loop)
-    while (my $sock = shift @ToClose) {
-        my $fd = fileno($sock);
-
-        # close the socket.  (not a Danga::Socket close)
-        $sock->close;
-
-        # and now we can finally remove the fd from the map.  see
-        # comment above in _cleanup.
-        delete $DescriptorMap{$fd};
-    }
-}
-
 # Internal function: run the post-event callback, send read events
 # for pushed-back data, and close pending connections.  returns 1
 # if event loop should continue, or 0 to shut it all down.
@@ -666,7 +648,20 @@ sub PostEventLoop {
         }
     }
 
-    CloseClosedSockets();
+    # now we can close sockets that wanted to close during our event processing.
+    # (we didn't want to close them during the loop, as we didn't want fd numbers
+    #  being reused and confused during the event loop)
+    while (my $sock = shift @ToClose) {
+        my $fd = fileno($sock);
+
+        # close the socket.  (not a Danga::Socket close)
+        $sock->close;
+
+        # and now we can finally remove the fd from the map.  see
+        # comment above in _cleanup.
+        delete $DescriptorMap{$fd};
+    }
+
 
     # by default we keep running, unless a postloop callback (either per-object
     # or global) cancels it
@@ -871,6 +866,12 @@ sub sock {
     return $self->{sock};
 }
 
+sub set_writer_func {
+   my Danga::Socket $self = shift;
+   my $wtr = shift;
+   Carp::croak("Not a subref") unless !defined $wtr || ref $wtr eq "CODE";
+   $self->{writer_func} = $wtr;
+}
 
 ### METHOD: write( $data )
 ### Write the specified data to the underlying handle.  I<data> may be scalar,
@@ -938,7 +939,12 @@ sub write {
         }
 
         my $to_write = $len - $self->{write_buf_offset};
-        my $written = syswrite($self->{sock}, $$bref, $to_write, $self->{write_buf_offset});
+        my $written;
+        if (my $wtr = $self->{writer_func}) {
+            $written = $wtr->($bref, $to_write, $self->{write_buf_offset});
+        } else {
+            $written = syswrite($self->{sock}, $$bref, $to_write, $self->{write_buf_offset});
+        }
 
         if (! defined $written) {
             if ($! == EPIPE) {
@@ -1000,17 +1006,6 @@ sub push_back_read {
     $PushBackSet{$self->{fd}} = $self;
 }
 
-### METHOD: shift_back_read( $buf )
-### Shift back I<buf> (a scalar or scalarref) into the read stream
-### Use this instead of push_back_read() when you need to unread
-### something you just read.
-sub shift_back_read {
-    my Danga::Socket $self = shift;
-    my $buf = shift;
-    unshift @{$self->{read_push_back}}, ref $buf ? $buf : \$buf;
-    $PushBackSet{$self->{fd}} = $self;
-}
-
 ### METHOD: read( $bytecount )
 ### Read at most I<bytecount> bytes from the underlying handle; returns scalar
 ### ref on read, or undef on connection closed.
@@ -1036,7 +1031,10 @@ sub read {
         }
     }
 
-    my $res = sysread($sock, $buf, $bytes, 0);
+    # max 5MB, or perl quits(!!)
+    my $req_bytes = $bytes > 5242880 ? 5242880 : $bytes;
+
+    my $res = sysread($sock, $buf, $req_bytes, 0);
     DebugLevel >= 2 && $self->debugmsg("sysread = %d; \$! = %d", $res, $!);
 
     if (! $res && $! != EWOULDBLOCK) {
