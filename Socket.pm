@@ -110,7 +110,7 @@ use Time::HiRes ();
 my $opt_bsd_resource = eval "use BSD::Resource; 1;";
 
 use vars qw{$VERSION};
-$VERSION = "1.51";
+$VERSION = "1.52";
 
 use warnings;
 no  warnings qw(deprecated);
@@ -273,9 +273,11 @@ sub AddTimer {
 
     my $fire_time = Time::HiRes::time() + $secs;
 
+    my $timer = bless [$fire_time, $coderef], "Danga::Socket::Timer";
+
     if (!@Timers || $fire_time >= $Timers[-1][0]) {
-        push @Timers, [$fire_time, $coderef];
-        return;
+        push @Timers, $timer;
+        return $timer;
     }
 
     # Now, where do we insert?  (NOTE: this appears slow, algorithm-wise,
@@ -284,8 +286,8 @@ sub AddTimer {
     # variety of datasets.)
     for (my $i = 0; $i < @Timers; $i++) {
         if ($Timers[$i][0] > $fire_time) {
-            splice(@Timers, $i, 0, [$fire_time, $coderef]);
-            return;
+            splice(@Timers, $i, 0, $timer);
+            return $timer;
         }
     }
 
@@ -375,7 +377,7 @@ sub RunTimers {
     # Run expired timers
     while (@Timers && $Timers[0][0] <= $now) {
         my $to_run = shift(@Timers);
-        $to_run->[1]->($now);
+        $to_run->[1]->($now) if $to_run->[1];
     }
 
     return $LoopTimeout unless @Timers;
@@ -870,7 +872,7 @@ sub sock {
 sub set_writer_func {
    my Danga::Socket $self = shift;
    my $wtr = shift;
-   Carp::croak("Not a subref") unless !defined $wtr || ref $wtr eq "CODE";
+   Carp::croak("Not a subref") unless !defined $wtr || UNIVERSAL::isa($wtr, "CODE");
    $self->{writer_func} = $wtr;
 }
 
@@ -921,7 +923,7 @@ sub write {
             $len = length($$bref); # this will die if $bref is a code ref, caught below
         };
         if ($@) {
-            if (ref $bref eq "CODE") {
+            if (UNIVERSAL::isa($bref, "CODE")) {
                 unless ($need_queue) {
                     $self->{write_buf_size}--; # code refs are worth 1
                     shift @{$self->{write_buf}};
@@ -1177,7 +1179,15 @@ sub peer_ip_string {
     my $pn = getpeername($self->{sock});
     return _undef("peer_ip_string undef: getpeername") unless $pn;
 
-    my ($port, $iaddr) = Socket::sockaddr_in($pn);
+    my ($port, $iaddr) = eval {
+        Socket::sockaddr_in($pn);
+    };
+
+    if ($@) {
+        $self->{peer_port} = "[Unknown peerport '$@']";
+        return "[Unknown peername '$@']";
+    }
+
     $self->{peer_port} = $port;
 
     return $self->{peer_ip} = Socket::inet_ntoa($iaddr);
@@ -1211,6 +1221,12 @@ sub _undef {
     my $msg = shift || "";
     warn "Danga::Socket: $msg\n";
     return undef;
+}
+
+package Danga::Socket::Timer;
+# [$abs_float_firetime, $coderef];
+sub cancel {
+    $_[0][1] = undef;
 }
 
 1;
