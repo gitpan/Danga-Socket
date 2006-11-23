@@ -100,7 +100,7 @@ use Time::HiRes ();
 my $opt_bsd_resource = eval "use BSD::Resource; 1;";
 
 use vars qw{$VERSION};
-$VERSION = "1.54";
+$VERSION = "1.55";
 
 use warnings;
 no  warnings qw(deprecated);
@@ -183,6 +183,7 @@ sub Reset {
 
     $PostLoopCallback = undef;
     %PLCMap = ();
+    $DoneInit = 0;
 }
 
 =head2 C<< CLASS->HaveEpoll() >>
