@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 #
 #   Perl Makefile for Danga-Socket
-#   $Id: Makefile.PL 62 2005-08-01 19:09:44Z bradfitz $
+#   $Id: Makefile.PL 119 2007-05-09 17:59:34Z bradfitz $
 #
 #   Invoke with 'perl Makefile.PL'
 #
@@ -13,7 +13,7 @@ use ExtUtils::MakeMaker;
 
 WriteMakefile(
     NAME                    => 'Danga::Socket',
-    VERSION_FROM            => 'Socket.pm', # finds $VERSION
+    VERSION_FROM            => 'lib/Danga/Socket.pm',
     AUTHOR                  => 'Brad Fitzpatrick <brad@danga.com>',
     ABSTRACT                => 'Async socket class',
     PREREQ_PM               => {
@@ -24,13 +24,6 @@ WriteMakefile(
         'Test::More'    => 0,
         'Time::HiRes'   => 0,
         'Sys::Syscall'  => 0,
-    },
-    dist                    => {
-        CI                      => "cvs commit",
-        RCS_LABEL               => 'cvs tag RELEASE_$(VERSION_SYM)',
-        SUFFIX                  => ".gz",
-        DIST_DEFAULT            => 'all tardist',
-        COMPRESS                => "gzip",
     },
 
 );
