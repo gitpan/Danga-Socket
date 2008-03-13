@@ -100,7 +100,7 @@ use Time::HiRes ();
 my $opt_bsd_resource = eval "use BSD::Resource; 1;";
 
 use vars qw{$VERSION};
-$VERSION = "1.58";
+$VERSION = "1.59";
 
 use warnings;
 no  warnings qw(deprecated);
@@ -185,6 +185,9 @@ sub Reset {
     %PLCMap = ();
     $DoneInit = 0;
 
+    POSIX::close($Epoll)  if defined $Epoll  && $Epoll  >= 0;
+    POSIX::close($KQueue) if defined $KQueue && $KQueue >= 0;
+    
     *EventLoop = *FirstTimeEventLoop;
 }
 
@@ -1062,6 +1065,8 @@ sub write {
             DebugLevel >= 2 && $self->debugmsg("Wrote ALL %d bytes to %d (nq=%d)",
                                                $written, $self->{fd}, $need_queue);
             $self->{write_buf_offset} = 0;
+
+            $self->watch_write(0) if $self->{event_watch} & POLLOUT;
 
             # this was our only write, so we can return immediately
             # since we avoided incrementing the buffer size or
